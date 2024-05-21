@@ -4,6 +4,8 @@
  *                         reserved.
  * Copyright (c) 2018-2019 Triad National Security, LLC. All rights
  *                         reserved.
+ * Copyright (c) 2024      High Performance Computing Center Stuttgart,                                                  
+ *                         University of Stuttgart.  All rights reserved.
  *
  * Additional copyrights may follow
  *
@@ -198,7 +200,7 @@ OPAL_DECLSPEC int mca_base_event_registration_alloc (mca_base_event_t *event, vo
 OPAL_DECLSPEC int mca_base_event_register_callback (mca_base_event_registration_t *registration, mca_base_cb_safety_t cb_safety,
                                                     opal_info_t *info, void *user_data, mca_base_event_cb_fn_t event_cbfn);
 
-OPAL_DECLSPEC void mca_base_event_registration_free (mca_base_event_registration_t *registration, mca_base_event_registration_free_cb_fn_t cbfn);
+OPAL_DECLSPEC void mca_base_event_registration_free (mca_base_event_registration_t *registration, void *user_data, mca_base_event_registration_free_cb_fn_t cbfn);
 
 OPAL_DECLSPEC void mca_base_event_registration_set_dropped_handler (mca_base_event_registration_t *registration, mca_base_event_dropped_cb_fn_t cbfn);
 

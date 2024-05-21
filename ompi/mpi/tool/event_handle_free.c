@@ -6,6 +6,8 @@
  * Copyright (c) 2017      IBM Corporation. All rights reserved.
  * Copyright (c) 2018-2019 Triad National Security, LLC. All rights
  *                         reserved.
+ * Copyright (c) 2024      High Performance Computing Center Stuttgart,                                                  
+ *                         University of Stuttgart.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -40,7 +42,7 @@ int MPI_T_event_handle_free (MPI_T_event_registration event_registration,
     if (MPI_T_EVENT_REGISTRATION_NULL == event_registration) {
         ret = MPI_T_ERR_INVALID_HANDLE;
     } else {
-        mca_base_event_registration_free (event_registration, 
+        mca_base_event_registration_free (event_registration, user_data,
                                           (mca_base_event_registration_free_cb_fn_t) free_cb_function);
     }
 
