@@ -51,6 +51,7 @@
 #include "opal/util/info.h"
 
 #include "ompi/info/info.h"
+#include "ompi/info/info_memkind.h"
 #include "ompi/runtime/mpiruntime.h"
 #include "ompi/runtime/params.h"
 #include "ompi/runtime/ompi_rte.h"
@@ -243,7 +244,7 @@ int ompi_mpiinfo_init_env(int argc, char *argv[], ompi_info_t *info)
 // related calls:
 
 int ompi_info_dup (ompi_info_t *info, ompi_info_t **newinfo) {
-    return opal_info_dup (&(info->super), (opal_info_t **)newinfo);
+    return opal_info_dup_public (&(info->super), (opal_info_t **)newinfo);
 }
 int ompi_info_set (ompi_info_t *info, const char *key, const char *value) {
     return opal_info_set (&(info->super), key, value);
@@ -350,6 +351,9 @@ int ompi_mpiinfo_finalize(void)
             }
         }
     }
+
+    /* Release the array of available memkind objects */
+    ompi_info_memkind_free_available();
 
     /* All done -- destroy the table */
 

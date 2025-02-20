@@ -23,9 +23,9 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2015-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2016-2017 IBM Corporation. All rights reserved.
- * Copyright (c) 2018-2022 Triad National Security, LLC. All rights
+ * Copyright (c) 2018-2024 Triad National Security, LLC. All rights
  *                         reserved.
- * Copyright (c) 2023      Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2023      NVIDIA Corporation.  All rights reserved.
  * $COPYRIGHT$
  *
@@ -53,6 +53,7 @@
 #include "ompi/dpm/dpm.h"
 #include "ompi/memchecker.h"
 #include "ompi/instance/instance.h"
+#include "ompi/info/info_memkind.h"
 
 /*
 ** Table for Fortran <-> C communicator handle conversion
@@ -68,6 +69,8 @@ ompi_predefined_communicator_t  ompi_mpi_comm_world = {{{{0}}}};
 ompi_predefined_communicator_t  ompi_mpi_comm_self = {{{{0}}}};
 ompi_predefined_communicator_t  ompi_mpi_comm_null = {{{{0}}}};
 ompi_communicator_t  *ompi_mpi_comm_parent = NULL;
+
+int ompi_comm_output = -1;
 
 static bool ompi_comm_intrinsic_init;
 
@@ -97,6 +100,14 @@ static int ompi_comm_finalize (void);
  */
 int ompi_comm_init(void)
 {
+
+    /* create output stream */
+
+    if (ompi_comm_output == -1) {
+        ompi_comm_output = opal_output_open(NULL);
+        opal_output_set_verbosity(ompi_comm_output, ompi_comm_verbose_level);
+    }
+
     /* Setup communicator array */
     OBJ_CONSTRUCT(&ompi_mpi_communicators, opal_pointer_array_t);
     if( OPAL_SUCCESS != opal_pointer_array_init(&ompi_mpi_communicators, 16,
@@ -256,6 +267,7 @@ int ompi_comm_init_mpi3 (void)
             free(str);
         }
     }
+
     /* Setup MPI_COMM_SELF */
     OBJ_CONSTRUCT(&ompi_mpi_comm_self, ompi_communicator_t);
     assert(ompi_mpi_comm_self.comm.c_f_to_c_index == 1);
@@ -289,6 +301,22 @@ int ompi_comm_init_mpi3 (void)
        predefined attributes.  If a user defines an attribute on
        MPI_COMM_SELF, the keyhash will automatically be created. */
     ompi_mpi_comm_self.comm.c_keyhash = NULL;
+
+    char *memkind_requested = getenv ("OMPI_MCA_mpi_memory_alloc_kinds");
+    if (NULL != memkind_requested) {
+        char *memkind_provided;
+        ompi_info_memkind_assert_type type;
+
+        ompi_info_memkind_process (memkind_requested, &memkind_provided, &type);
+        opal_infosubscribe_subscribe (&ompi_mpi_comm_world.comm.super, "mpi_memory_alloc_kinds", memkind_provided, ompi_info_memkind_cb);
+        opal_infosubscribe_subscribe (&ompi_mpi_comm_self.comm.super, "mpi_memory_alloc_kinds", memkind_provided, ompi_info_memkind_cb);
+        opal_infosubscribe_subscribe (&ompi_mpi_comm_world.comm.instance->super, "mpi_memory_alloc_kinds", memkind_provided, ompi_info_memkind_cb);
+        if (OMPI_INFO_MEMKIND_ASSERT_NO_ACCEL == type) {
+            ompi_mpi_comm_world.comm.c_assertions |= OMPI_COMM_ASSERT_NO_ACCEL_BUF;
+            ompi_mpi_comm_self.comm.c_assertions |= OMPI_COMM_ASSERT_NO_ACCEL_BUF;
+        }
+        free (memkind_provided);
+    }
 
     /*
      * finally here we set the predefined attribute keyvals
@@ -355,13 +383,13 @@ static int ompi_comm_finalize (void)
     OBJ_DESTRUCT( &ompi_mpi_comm_null );
 
     /* Check whether we have some communicators left */
-    max = opal_pointer_array_get_size(&ompi_mpi_communicators);
+    max = ompi_comm_get_num_communicators();
     for ( i=3; i<max; i++ ) {
-        comm = (ompi_communicator_t *)opal_pointer_array_get_item(&ompi_mpi_communicators, i);
+        comm = ompi_comm_lookup(i);
         if ( NULL != comm ) {
             /* Communicator has not been freed before finalize */
             OBJ_RELEASE(comm);
-            comm=(ompi_communicator_t *)opal_pointer_array_get_item(&ompi_mpi_communicators, i);
+            comm = ompi_comm_lookup(i);
             if ( NULL != comm ) {
                 /* Still here ? */
                 if ( !OMPI_COMM_IS_EXTRA_RETAIN(comm)) {
@@ -392,6 +420,11 @@ static int ompi_comm_finalize (void)
     /* finalize communicator requests */
     ompi_comm_request_fini ();
 
+    /* close output stream */
+
+    opal_output_close(ompi_comm_output);
+    ompi_comm_output = -1;
+
     /* release a reference to the attributes subsys */
     return ompi_attr_put_ref();
 }
@@ -417,6 +450,7 @@ static void ompi_comm_construct(ompi_communicator_t* comm)
     comm->c_coll         = NULL;
     comm->c_nbc_tag      = MCA_COLL_BASE_TAG_NONBLOCKING_BASE;
     comm->instance       = NULL;
+    comm->c_index_vec    = NULL;
 
     /*
      * magic numerology - see TOPDIR/ompi/include/mpif-values.pl
@@ -516,6 +550,11 @@ static void ompi_comm_destruct(ompi_communicator_t* comm)
     if (NULL != comm->c_name) {
         free (comm->c_name);
         comm->c_name = NULL;
+    }
+
+    if (NULL != comm->c_index_vec) {
+        free (comm->c_index_vec);
+        comm->c_index_vec = NULL;
     }
 
 #if OPAL_ENABLE_FT_MPI

@@ -62,6 +62,7 @@ static int mca_pml_ob1_component_fini(void);
 int mca_pml_ob1_output = 0;
 static int mca_pml_ob1_verbose = 0;
 bool mca_pml_ob1_matching_protection = false;
+int mca_pml_ob1_accelerator_events_max = 400;
 
 static opal_datatype_t *mca_pml_ob1_match_hdr_types[] = {
     &ompi_mpi_int16_t.dt.super, &ompi_mpi_int32_t.dt.super,
@@ -345,6 +346,12 @@ static int mca_pml_ob1_component_register(void)
                                            MCA_BASE_VAR_TYPE_UNSIGNED_INT, NULL, MPI_T_BIND_MPI_COMM,
                                            MCA_BASE_PVAR_FLAG_READONLY | MCA_BASE_PVAR_FLAG_CONTINUOUS,
                                            mca_pml_ob1_get_posted_recvq_size, NULL, mca_pml_ob1_comm_size_notify, NULL);
+
+    mca_pml_ob1_accelerator_events_max = 400;
+    (void) mca_base_component_var_register(&mca_pml_ob1_component.pmlm_version, "accelerator_events_max",
+                                           "Number of events created by the ob1 component internally",
+                                           MCA_BASE_VAR_TYPE_INT, NULL, 0, 0, OPAL_INFO_LVL_5,
+                                           MCA_BASE_VAR_SCOPE_READONLY, &mca_pml_ob1_accelerator_events_max);
 
     mca_base_component_event_register_list (&mca_pml_ob1_component.pmlm_version, mca_pml_ob1_events, MCA_PML_OB1_EVENT_MAX);
 

@@ -1,12 +1,13 @@
 /* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil -*- */
 /*
- * Copyright (c) 2018-2022 Triad National Security, LLC. All rights
+ * Copyright (c) 2018-2024 Triad National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2022      Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2022      The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
+ * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -32,6 +33,7 @@
 #include "ompi/errhandler/errcode.h"
 #include "ompi/message/message.h"
 #include "ompi/info/info.h"
+#include "ompi/info/info_memkind.h"
 #include "ompi/attribute/attribute.h"
 #include "ompi/op/op.h"
 #include "ompi/dpm/dpm.h"
@@ -53,10 +55,11 @@
 #include "ompi/mca/topo/base/base.h"
 #include "opal/mca/pmix/base/base.h"
 
-#include "opal/mca/mpool/base/mpool_base_tree.h"
 #include "ompi/mca/pml/base/pml_base_bsend.h"
 #include "ompi/util/timings.h"
+#include "opal/mca/mpool/base/mpool_base_tree.h"
 #include "opal/mca/pmix/pmix-internal.h"
+#include "opal/util/clock_gettime.h"
 
 ompi_predefined_instance_t ompi_mpi_instance_null = {{{{0}}}};
 
@@ -73,6 +76,14 @@ __opal_attribute_constructor__ static void instance_lock_init(void) {
 
 /** MPI_Init instance */
 ompi_instance_t *ompi_mpi_instance_default = NULL;
+
+/**
+ * @brief: Base timer initialization. All timers returned to the user via MPI_Wtime
+ *         are relative to this timer. Setting it early in during the common
+ *         initialization (world or session model) allows for measuring the cost of
+ *         the MPI initialization.
+ */
+struct timespec ompi_wtime_time_origin = {.tv_sec = 0};
 
 enum {
     OMPI_INSTANCE_INITIALIZING = -1,
@@ -115,7 +126,7 @@ static mca_base_framework_t *ompi_framework_dependencies[] = {
     &ompi_hook_base_framework, &ompi_op_base_framework,
     &opal_allocator_base_framework, &opal_rcache_base_framework, &opal_mpool_base_framework, &opal_smsc_base_framework,
     &ompi_bml_base_framework, &ompi_pml_base_framework, &ompi_coll_base_framework,
-    &ompi_osc_base_framework, NULL,
+    &ompi_osc_base_framework, &ompi_part_base_framework, NULL,
 };
 
 static mca_base_framework_t *ompi_lazy_frameworks[] = {
@@ -221,6 +232,8 @@ void ompi_mpi_instance_release (void)
 
     opal_argv_free (ompi_mpi_instance_pmix_psets);
     ompi_mpi_instance_pmix_psets = NULL;
+
+    OBJ_DESTRUCT(&ompi_mpi_instance_null);
 
     opal_finalize_cleanup_domain (&ompi_instance_basic_domain);
     OBJ_DESTRUCT(&ompi_instance_basic_domain);
@@ -355,6 +368,10 @@ static int ompi_mpi_instance_init_common (int argc, char **argv)
     pmix_status_t rc;
     opal_pmix_lock_t mylock;
     OMPI_TIMING_INIT(64);
+
+    // We intentionally don't use the OPAL timer framework here.  See
+    // https://github.com/open-mpi/ompi/issues/3003 for more details.
+    (void) opal_clock_gettime(&ompi_wtime_time_origin);
 
     ret = ompi_mpi_instance_retain ();
     if (OPAL_UNLIKELY(OMPI_SUCCESS != ret)) {
@@ -655,11 +672,7 @@ static int ompi_mpi_instance_init_common (int argc, char **argv)
         return ompi_instance_print_error ("ompi_win_init() failed", ret);
     }
 
-    /* initialize partcomm */
-    if (OMPI_SUCCESS != (ret = mca_base_framework_open(&ompi_part_base_framework, 0))) {
-        return ompi_instance_print_error ("mca_part_base_select() failed", ret);
-    }
-
+    /* select part component to use */
     if (OMPI_SUCCESS != (ret = mca_part_base_select (true, true))) {
         return ompi_instance_print_error ("mca_part_base_select() failed", ret);
     }
@@ -845,7 +858,21 @@ int ompi_mpi_instance_init (int ts_level,  opal_info_t *info, ompi_errhandler_t 
 
     /* Copy info if there is one. */
     if (OPAL_UNLIKELY(NULL != info)) {
+        opal_cstring_t *memkind_requested;
+        ompi_info_memkind_assert_type type;
+        int flag;
+        
         new_instance->super.s_info = OBJ_NEW(opal_info_t);
+        opal_info_get(info, "mpi_memory_alloc_kinds", &memkind_requested, &flag);
+        if (1 == flag) {
+            char *memkind_provided;
+            ompi_info_memkind_process (memkind_requested->string, &memkind_provided, &type);
+            opal_infosubscribe_subscribe (&new_instance->super, "mpi_memory_alloc_kinds",
+                                          memkind_provided, ompi_info_memkind_cb);
+            free (memkind_provided);
+            OBJ_RELEASE(memkind_requested);
+        }
+
         if (info) {
             opal_info_dup(info, &new_instance->super.s_info);
         }
@@ -950,16 +977,7 @@ static int ompi_mpi_instance_finalize_common (void)
 
     ompi_proc_finalize();
 
-    OBJ_DESTRUCT(&ompi_mpi_instance_null);
-
     ompi_mpi_instance_release ();
-
-    if (0 == opal_initialized) {
-        /* if there is no MPI_T_init_thread that has been MPI_T_finalize'd,
-         * then be gentle to the app and release all the memory now (instead
-         * of the opal library destructor */
-        opal_class_finalize ();
-    }
 
     return OMPI_SUCCESS;
 }
@@ -991,16 +1009,18 @@ static void ompi_instance_get_num_psets_complete (pmix_status_t status,
     size_t n;
     pmix_status_t rc;
     size_t sz;
-    size_t num_pmix_psets = 0;
+    size_t num_pmix_psets = 0, *num_pmix_psets_ptr;
     char *pset_names = NULL;
 
     opal_pmix_lock_t *lock = (opal_pmix_lock_t *) cbdata;
+
+    num_pmix_psets_ptr = &num_pmix_psets;
 
     for (n=0; n < ninfo; n++) {
         if (0 == strcmp(info[n].key,PMIX_QUERY_NUM_PSETS)) {
             PMIX_VALUE_UNLOAD(rc,
                               &info[n].value,
-                              (void **)&num_pmix_psets,
+                              (void **)&num_pmix_psets_ptr,
                               &sz);
             if (rc != PMIX_SUCCESS) {
                 opal_argv_free (ompi_mpi_instance_pmix_psets);
@@ -1089,7 +1109,8 @@ int ompi_instance_get_num_psets (ompi_instance_t *instance, int *npset_names)
 
 int ompi_instance_get_nth_pset (ompi_instance_t *instance, int n, int *len, char *pset_name)
 {
-    if (NULL == ompi_mpi_instance_pmix_psets && n >= ompi_instance_builtin_count) {
+    if (NULL == ompi_mpi_instance_pmix_psets ||
+        (size_t) n >= (ompi_instance_builtin_count + ompi_mpi_instance_num_pmix_psets)) {
         ompi_instance_refresh_pmix_psets (PMIX_QUERY_PSET_NAMES);
     }
 
@@ -1227,71 +1248,112 @@ static int ompi_instance_group_self (ompi_instance_t *instance, ompi_group_t **g
 
 static int ompi_instance_group_pmix_pset (ompi_instance_t *instance, const char *pset_name, ompi_group_t **group_out)
 {
+    int ret = OMPI_SUCCESS;
+    size_t i,n;
+    bool isnew, try_again = false, refresh = true;
     pmix_status_t rc;
-    pmix_proc_t p;
-    ompi_group_t *group;
-    pmix_value_t *pval = NULL;
-    char *stmp = NULL;
-    size_t size = 0;
+    ompi_group_t *group = NULL;
+    pmix_query_t query;
+    pmix_info_t *info = NULL;
+    size_t ninfo;
+    opal_process_name_t pname;
 
-    /* make the group large enough to hold world */
-    group = ompi_group_allocate (NULL, ompi_process_info.num_procs);
-    if (OPAL_UNLIKELY(NULL == group)) {
-        return OMPI_ERR_OUT_OF_RESOURCE;
+    PMIX_QUERY_CONSTRUCT(&query);
+    PMIX_ARGV_APPEND(rc, query.keys, PMIX_QUERY_PSET_MEMBERSHIP);
+    PMIX_INFO_CREATE(query.qualifiers, 1);
+    query.nqual = 1;
+    PMIX_INFO_LOAD(&query.qualifiers[0], PMIX_PSET_NAME, pset_name, PMIX_STRING);
+
+    /*
+     * First try finding in the local PMIx cache, if not found, try a refresh
+     */
+fn_try_again:
+    if (PMIX_SUCCESS != (rc = PMIx_Query_info(&query, 1, &info, &ninfo)) || 0 == ninfo) {
+        if ((PMIX_ERR_NOT_FOUND == rc) && (false == try_again)) {
+            try_again = true;
+            PMIX_QUERY_DESTRUCT(&query);
+            PMIX_QUERY_CONSTRUCT(&query);
+            PMIX_ARGV_APPEND(rc, query.keys, PMIX_QUERY_PSET_MEMBERSHIP);
+            PMIX_INFO_CREATE(query.qualifiers, 2);
+            PMIX_INFO_LOAD(&query.qualifiers[0], PMIX_PSET_NAME, pset_name, PMIX_STRING);
+            PMIX_INFO_LOAD(&query.qualifiers[1], PMIX_QUERY_REFRESH_CACHE, &refresh, PMIX_BOOL);
+            query.nqual = 2;
+            goto fn_try_again;
+        }	    
     }
 
-
-    for (size_t i = 0 ; i < ompi_process_info.num_procs ; ++i) {
-        opal_process_name_t name = {.vpid = i, .jobid = OMPI_PROC_MY_NAME->jobid};
-
-        OPAL_PMIX_CONVERT_NAME(&p, &name);
-        rc = PMIx_Get(&p, PMIX_PSET_NAME, NULL, 0, &pval);
-        if (OPAL_UNLIKELY(PMIX_SUCCESS != rc)) {
-            OBJ_RELEASE(group);
-            return opal_pmix_convert_status(rc);
+    if (PMIX_SUCCESS != rc) {
+        char msg_string[1024];
+        switch (rc) {
+        case PMIX_ERR_NOT_FOUND:
+            ret = MPI_ERR_ARG; /* pset_name not valid */
+            break;
+        case PMIX_ERR_UNREACH:
+            sprintf(msg_string,"PMIx server unreachable");
+            opal_show_help("help-comm.txt",
+                           "MPI function not supported",
+                           true,
+                           "MPI_Group_from_session_pset",
+                           msg_string);
+            ret = MPI_ERR_UNSUPPORTED_OPERATION;
+            break;
+        case PMIX_ERR_NOT_SUPPORTED:
+            sprintf(msg_string,"PMIx server does not support PMIX_QUERY_PSET_MEMBERSHIP operation");
+            opal_show_help("help-comm.txt",
+                           "MPI function not supported",
+                           true,
+                           "MPI_Group_from_session_pset",
+                           msg_string);
+            ret = MPI_ERR_UNSUPPORTED_OPERATION;
+            break;
+        default:
+            ret = opal_pmix_convert_status(rc);
+            break;
         }
-
-        PMIX_VALUE_UNLOAD(rc,
-                          pval,
-                          (void **)&stmp,
-                          &size);
-        if (0 != strcmp (pset_name, stmp)) {
-            PMIX_VALUE_RELEASE(pval);
-            free(stmp);
-            continue;
-        }
-        PMIX_VALUE_RELEASE(pval);
-        free(stmp);
-
-        /* look for existing ompi_proc_t that matches this name */
-        group->grp_proc_pointers[size] = (ompi_proc_t *) ompi_proc_lookup (name);
-        if (NULL == group->grp_proc_pointers[size]) {
-            /* set sentinel value */
-            group->grp_proc_pointers[size] = (ompi_proc_t *) ompi_proc_name_to_sentinel (name);
-        } else {
-            OBJ_RETAIN (group->grp_proc_pointers[size]);
-        }
-        ++size;
+        ompi_instance_print_error ("PMIx_Query_info() failed", ret);
+        goto fn_w_query;
     }
 
-    /* shrink the proc array if needed */
-    if (size < (size_t) group->grp_proc_count) {
-        void *tmp = realloc (group->grp_proc_pointers, size * sizeof (group->grp_proc_pointers[0]));
-        if (OPAL_UNLIKELY(NULL == tmp)) {
-            OBJ_RELEASE(group);
-            return OMPI_ERR_OUT_OF_RESOURCE;
-        }
+    for(n = 0; n < ninfo; n++){
+        if(0 == strcmp(info[n].key, PMIX_QUERY_PSET_MEMBERSHIP)){
+            
+            pmix_data_array_t *data_array = info[n].value.data.darray;
+            pmix_proc_t *members_array = (pmix_proc_t*) data_array->array;
 
-        group->grp_proc_pointers = (ompi_proc_t **) tmp;
-        group->grp_proc_count = (int) size;
+            group = ompi_group_allocate (NULL, data_array->size);
+            if (OPAL_UNLIKELY(NULL == group)) {
+                ret = OMPI_ERR_OUT_OF_RESOURCE;
+                goto fn_w_info;
+            }
+
+            for(i = 0; i < data_array->size; i++){
+                OPAL_PMIX_CONVERT_PROCT(ret, &pname, &members_array[i]);
+		if (OPAL_SUCCESS == rc) {
+                    group->grp_proc_pointers[i] = ompi_proc_find_and_add(&pname,&isnew);
+                } else {
+                    ompi_instance_print_error ("OPAL_PMIX_CONVERT_PROCT failed %d", ret);
+                    ompi_group_free(&group);
+                    goto fn_w_info;
+                }
+            }
+            break;
+        }
     }
 
-    ompi_set_group_rank (group, ompi_proc_local());
+    if (NULL != group) {
+        ompi_set_group_rank (group, ompi_proc_local());
+        group->grp_instance = instance;
+        *group_out = group;
+    } else {
+        ret = OMPI_ERR_NOT_FOUND;
+    }
 
-    group->grp_instance = instance;
+fn_w_info:
+    PMIX_INFO_DESTRUCT(info);
+fn_w_query:
+    PMIX_QUERY_DESTRUCT(&query);
 
-    *group_out = group;
-    return OMPI_SUCCESS;
+    return ret;
 }
 
 static int ompi_instance_get_pmix_pset_size (ompi_instance_t *instance, const char *pset_name, size_t *size_out)

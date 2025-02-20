@@ -21,9 +21,11 @@
  * Copyright (c) 2018      Amazon.com, Inc. or its affiliates.  All Rights reserved.
  * Copyright (c) 2018      Triad National Security, LLC. All rights
  *                         reserved.
- * Copyright (c) 2019-2021 Google, Inc. All rights reserved.
+ * Copyright (c) 2019-2025 Google, Inc. All rights reserved.
  * Copyright (c) 2021      Nanook Consulting.  All rights reserved.
  * Copyright (c) 2022      IBM Corporation.  All rights reserved.
+ * Copyright (c) 2022      Computer Architecture and VLSI Systems (CARV)
+ *                         Laboratory, ICS Forth. All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -34,6 +36,7 @@
 
 #include "opal/mca/btl/base/btl_base_error.h"
 #include "opal/mca/threads/mutex.h"
+#include "opal/util/bit_ops.h"
 #include "opal/util/output.h"
 #include "opal/util/printf.h"
 
@@ -180,7 +183,7 @@ static int mca_btl_sm_component_register(void)
 
     mca_btl_sm_component.fbox_size = 4096;
     (void) mca_base_component_var_register(&mca_btl_sm_component.super.btl_version, "fbox_size",
-                                           "Size of per-peer fast transfer buffers (default: 4k)",
+                                           "Size of per-peer fast transfer buffers. Must be a power of two (default: 4k)",
                                            MCA_BASE_VAR_TYPE_UNSIGNED_INT, NULL, 0,
                                            MCA_BASE_VAR_FLAG_SETTABLE, OPAL_INFO_LVL_5,
                                            MCA_BASE_VAR_SCOPE_LOCAL,
@@ -322,8 +325,10 @@ mca_btl_sm_component_init(int *num_btls, bool enable_progress_threads, bool enab
         component->segment_size = (2 << 20);
     }
 
-    component->fbox_size = (component->fbox_size + MCA_BTL_SM_FBOX_ALIGNMENT_MASK)
-                           & ~MCA_BTL_SM_FBOX_ALIGNMENT_MASK;
+    if (component->fbox_size & (component->fbox_size - 1)) {
+        BTL_VERBOSE(("fast box size must be a power of two, rounding up to next power of two."));
+        component->fbox_size = opal_next_poweroftwo_inclusive(component->fbox_size);
+    }
 
     if (component->segment_size > (1ul << MCA_BTL_SM_OFFSET_BITS)) {
         component->segment_size = 2ul << MCA_BTL_SM_OFFSET_BITS;
@@ -338,6 +343,10 @@ mca_btl_sm_component_init(int *num_btls, bool enable_progress_threads, bool enab
         mca_btl_sm.super.btl_get = mca_btl_sm_get;
         mca_btl_sm.super.btl_put = mca_btl_sm_put;
 
+        if (mca_smsc_base_has_feature(MCA_SMSC_FEATURE_ACCELERATOR)) {
+            mca_btl_sm.super.btl_flags |= MCA_BTL_FLAGS_ACCELERATOR_GET;
+        }
+
         mca_btl_sm.super.btl_bandwidth = 40000; /* Mbs */
 
         if (mca_smsc_base_has_feature(MCA_SMSC_FEATURE_CAN_MAP)) {
@@ -346,7 +355,7 @@ mca_btl_sm_component_init(int *num_btls, bool enable_progress_threads, bool enab
             mca_btl_sm.super.btl_max_send_size = mca_btl_sm.super.btl_eager_limit;
             mca_btl_sm.super.btl_min_rdma_pipeline_size = INT_MAX;
         }
-        if (mca_smsc_base_has_feature(MCA_SMSC_FEATURE_REQUIRE_REGISTATION)) {
+        if (mca_smsc_base_has_feature(MCA_SMSC_FEATURE_REQUIRE_REGISTRATION)) {
             ssize_t handle_size = mca_smsc_base_registration_data_size();
             if (handle_size > 0) {
                 mca_btl_sm.super.btl_registration_handle_size = (size_t) handle_size;
@@ -437,9 +446,9 @@ void mca_btl_sm_poll_handle_frag(mca_btl_sm_hdr_t *hdr, struct mca_btl_base_endp
                                               .cbdata = reg->cbdata};
 
     if (hdr->flags & MCA_BTL_SM_FLAG_SINGLE_COPY) {
-        void *ctx = MCA_SMSC_CALL(map_peer_region, endpoint->smsc_endpoint, /*flags=*/0,
-                                  hdr->sc_iov.iov_base, hdr->sc_iov.iov_len,
-                                  &segments[1].seg_addr.pval);
+        void *ctx = MCA_SMSC_CALL(map_peer_region, endpoint->smsc_endpoint,
+                                  MCA_RCACHE_FLAGS_PERSIST, hdr->sc_iov.iov_base,
+                                  hdr->sc_iov.iov_len, &segments[1].seg_addr.pval);
         assert(NULL != ctx);
 
         segments[1].seg_len = hdr->sc_iov.iov_len;

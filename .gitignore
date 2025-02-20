@@ -154,6 +154,7 @@ examples/hello_cxx
 examples/hello_mpifh
 examples/hello_usempi
 examples/hello_usempif08
+examples/hello_sessions_c
 examples/ring_c
 examples/ring_cxx
 examples/ring_mpifh
@@ -333,6 +334,9 @@ opal/tools/wrappers/opal.pc
 
 opal/util/show_help_lex.c
 opal/util/keyval/keyval_lex.c
+
+test/monitoring/aggregate_profile.pl
+test/monitoring/profile2mat.pl
 
 test/simple/abort
 test/simple/accept
